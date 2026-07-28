@@ -10,6 +10,7 @@ from tkinter import *
 import cv2
 import pytesseract as tess
 import numpy as np
+import time
 import datetime
 from datetime import datetime
 from PIL import Image, ImageTk
@@ -189,9 +190,20 @@ class HealthJournalApp:
         #displays selected image
         if file_path:
             image = cv2.imread(file_path)
+            if image is None:
+                return
             
             #sends image to be processed
-            self.process_scanning((tess.image_to_string(self.image_process(image), lang = "eng")).lower())
+            start_time = time.perf_counter()
+            ocr_image = self.image_process(image)
+            ocr_text = tess.image_to_string(
+                ocr_image,
+                lang="eng",
+                config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+            )
+            self.process_scanning(ocr_text.lower())
+            elapsed = time.perf_counter() - start_time
+            print(f"Image processing took {elapsed:.3f} seconds")
             
             image = self.resize_image(image, 300/650*self.log_width, 400/820*self.log_height)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
@@ -202,6 +214,29 @@ class HealthJournalApp:
             self.image_label.image = image
             self.log_btn.focus_force()
     
+    def extract_nutrition_value(self, input_str, label_pattern):
+        cleaned_text = input_str.replace("—", "-").replace("–", "-")
+        cleaned_text = re.sub(r"\s+", " ", cleaned_text)
+
+        patterns = [
+            rf"{label_pattern}\s*[:#-]?\s*([0-9]+(?:\.[0-9]+)?(?:[a-zA-Z0-9]*)?)",
+            rf"([0-9]+(?:\.[0-9]+)?(?:[a-zA-Z0-9]*)?)\s*[:#-]?\s*{label_pattern}"
+        ]
+
+        for pattern in patterns:
+            match = re.search(pattern, cleaned_text, re.IGNORECASE)
+            if match:
+                token = match.group(1).strip()
+                token = token.replace(",", "")
+
+                # keep only the numeric part, but handle common OCR confusions such as g -> 9
+                token = re.sub(r"[^0-9.]", "", token)
+                if token and token != ".":
+                    if token.endswith("9") and len(token) > 2 and "calorie" not in label_pattern:
+                        token = token[:-1]
+                    return float(token)
+        return None
+
     #receives string of text that came from image processing     
     def process_scanning(self, input_str):
         #unlocks text inputs to user (in case a value is not found in processing or is inaccurate)
@@ -211,62 +246,68 @@ class HealthJournalApp:
         self.protein_input.configure(state = "normal", fg = self.BLACK, bd = 2, relief = "solid", bg=self.WHITE)
 
         #searches text calorie, fats, carbs, and protein content 
-        try:
-            cal = re.search(r"calories\s*(\d+(\.\d+)?)", input_str)
+        cal = self.extract_nutrition_value(input_str, r"calories?")
+        if cal is not None:
             self.cal_input.delete(0, END)
-            self.cal_input.insert(0, str(float(cal.group(1))))
-        except:
-            pass
+            self.cal_input.insert(0, str(cal))
             
-        try:
-            fat = re.search(r"al\s*fat\s*(\d+(\.\d+)?)", input_str)
+        fat = self.extract_nutrition_value(input_str, r"(?:a|al)?\s*fat")
+        if fat is not None:
             self.fats_input.configure(state = "normal", fg = self.BLACK)
             self.fats_input.delete(0, END)
-            self.fats_input.insert(0, str(float(fat.group(1))))
-        except:
-            pass
+            self.fats_input.insert(0, str(fat))
         
-        try:
-            carbs = re.search(r"carbohydrate\s*(\d+(\.\d+)?)", input_str)
+        carbs = self.extract_nutrition_value(input_str, r"carbohydrate(?:s)?")
+        if carbs is not None:
             self.carbs_input.configure(state = "normal", fg = self.BLACK)
             self.carbs_input.delete(0, END)
-            self.carbs_input.insert(0, str(float(carbs.group(1))))
-        except:
-            pass
+            self.carbs_input.insert(0, str(carbs))
 
-        try:
-            protein = re.search(r"protein\s*(\d+(\.\d+)?)", input_str)
+        protein = self.extract_nutrition_value(input_str, r"protein")
+        if protein is not None:
             self.protein_input.configure(state = "normal", fg = self.BLACK)
             self.protein_input.delete(0, END)
-            self.protein_input.insert(0, str(float(protein.group(1))))
-        except:
-            pass
+            self.protein_input.insert(0, str(protein))
     
     #removes horizontal and vertical lines from given image
     def remove_lines(self, image):
-        kernel_size = 500
-        
-        #creates image with everything but horizontal lines
-        kernel = np.ones((1,kernel_size),np.uint8)
-        horizontal = 255 - cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
-        
-        #creates image with everything but vertical lines
-        kernel = np.ones((kernel_size,1),np.uint8)
-        vertical = 255 - cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel)
-        
-        #combines images
-        temp = cv2.add(vertical, horizontal)
-        return cv2.add(temp, image)
+        if image is None:
+            return image
+
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, binary = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+
+        height, width = image.shape[:2]
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(5, width // 80), 1))
+        vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(5, height // 80)))
+
+        horizontal_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, horizontal_kernel, iterations=1)
+        vertical_lines = cv2.morphologyEx(binary, cv2.MORPH_OPEN, vertical_kernel, iterations=1)
+        mask = cv2.bitwise_or(horizontal_lines, vertical_lines)
+
+        cleaned = image.copy()
+        cleaned[mask > 0] = [255, 255, 255]
+        return cleaned
     
     #pre-processes image for text extraction                   
     def image_process(self, image):
+        if image is None:
+            return image
+
+        height, width = image.shape[:2]
+        max_dim = 1200
+        if max(height, width) > max_dim:
+            scale = max_dim / max(height, width)
+            image = cv2.resize(image, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+
         image = self.remove_lines(image)
         
         #converted to black and white
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, image = cv2.threshold(image, 200, 255,cv2.THRESH_BINARY)
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        _, image = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         
-        kernel = np.ones((1,1),np.uint8)
+        kernel = np.ones((2, 2), np.uint8)
         image = cv2.morphologyEx(image, cv2.MORPH_CLOSE, kernel, iterations=1)
         return image
     
